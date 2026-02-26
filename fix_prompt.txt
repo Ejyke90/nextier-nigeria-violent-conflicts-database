@@ -1,0 +1,10 @@
+I need help fixing a DatabaseError when ingesting embeddings into a PostgreSQL database using Python and asyncpg with the pgvector extension.
+The Error:
+I am getting the following error:
+app.exceptions.DatabaseError: Failed to ingest email ... Details: {'error': 'invalid input syntax for type vector: "[[-0.006658...]]"'}
+My Analysis:
+The error indicates that Postgres is receiving a string representation of a nested list (note the double brackets [[...]]), but the vector type expects a flat array.
+It seems my current code is either manually converting the embedding list to a string using str(embedding_list) before sending it to the DB, OR the list itself is nested (e.g., a list containing one list) before being converted.
+The Goal:
+Please modify the Python code in postgres_database_service.py (and wherever the call originates) to correctly pass the embedding data to asyncpg.
+Based on my debugging, the solution should likely involve ensuring the embedding is a flat Python list of floats (not nested) and passing that list directly to the asyncpg query parameters without manually converting it to a string first. Let asyncpg handle the type conversion for the vector column.
