@@ -17,41 +17,160 @@ authoritative reference for:
 
 Your job is to read the existing code, identify gaps between what is implemented
 and what is described here, then fix or refactor the code until it satisfies the
-experiment requirements and success criteria below. Do not add features not
-described here. Do not change the models. Do not simplify the retrieval pipeline
-below the minimum described. The experiment is the deliverable — the code exists
-to prove it.
+experiment requirements and success criteria. Do not add features not described
+here. Do not change the models. Do not simplify the retrieval pipeline below the
+minimum described. The experiment is the deliverable — the code exists to prove it.
 
 ---
 
 ## Hard Constraints — Non-Negotiable
 
-These constraints are not preferences. Any code that violates them must be fixed.
+Any code that violates these must be fixed.
 
 | Constraint | Enforcement |
 |---|---|
 | **No Full-Text Search of any kind** | No `tsvector`, no `LIKE`, no `ILIKE`, no `FULLTEXT`, no BM25, no FTS5, no keyword index on email subject or body. Data classification forbids it. Any such code must be removed. |
 | **No plaintext data on disk** | OCP PVC uses an encrypted storage class. No intermediate files containing email text written to unencrypted paths. Embedding generation happens in memory only. |
-| **RLS enforced at the DB layer** | Postgres Row-Level Security policies on every user-data table. User isolation is not enforced in application code — it is enforced in the database. Application code sets the session variable; the DB enforces the policy. |
-| **All LLM calls go to Ollama** | No calls to OpenAI, Anthropic API, Cohere, or any external LLM API. Ollama runs locally. Every LLM call — enrichment, tag extraction, contextual prefix generation, report generation — hits the Ollama endpoint. |
-| **Embedding model is `intfloat/multilingual-e5-large`** | No substitutions. This model produces 1024-dimensional vectors. The pgvector column must be `vector(1024)`. Any mismatch will silently corrupt retrieval. |
-| **Ollama model is `llama3.1`** | Model name in all Ollama API calls must be `llama3.1`. Do not hardcode `llama3`, `llama2`, or any other variant unless the deployment explicitly confirms the available tag. |
+| **RLS enforced at the DB layer** | Postgres Row-Level Security on every user-data table. User isolation is not enforced in application code — it is enforced in the database. Application code sets the session variable; the DB enforces the policy. |
+| **All LLM calls go to Ollama** | No calls to OpenAI, Anthropic API, Cohere, or any external LLM API. Ollama runs locally inside the cluster. Every LLM call — enrichment, tag extraction, contextual prefix, report generation — hits the Ollama internal service endpoint. |
+| **Ollama model is `llama3.1`** | Model name in all Ollama API calls must be `llama3.1`. |
+| **Emails are multilingual** | French, Spanish, English, and others are present. The embedding model must support multilingual content. English-only models are not acceptable. |
+| **Embedding model is environment-dependent** | See the Model Selection section below. The correct model depends on whether a GPU node is available to the RAG embedding pod. The vector column dimension in Postgres must match the active model exactly. A mismatch silently corrupts retrieval. |
+
+---
+
+## ⚠️ Embedding Model Selection — Read Before Touching Schema or Embedding Code
+
+GPU availability for the RAG app pod is **not confirmed**. The codebase must
+support both deployment paths. The active path is controlled by a single
+environment variable.
+
+```
+EMBEDDING_PROFILE=gpu   →  intfloat/multilingual-e5-large  (1024-dim)
+EMBEDDING_PROFILE=cpu   →  intfloat/multilingual-e5-base   (768-dim)
+```
+
+### Why Two Models, Not One
+
+| Property | `multilingual-e5-large` (GPU) | `multilingual-e5-base` (CPU) |
+|---|---|---|
+| **Dimensions** | **1024** | **768** |
+| **Model size** | ~560 MB | ~278 MB |
+| **RAM at runtime** | ~2.5–4 GB | ~1.2–2 GB |
+| **CPU inference / query** | 80–200 ms — too slow for prod | 20–60 ms — acceptable |
+| **GPU inference / query** | 5–15 ms — fast | N/A |
+| **Ingestion batch (CPU, 1000 emails)** | 10–30 min — operationally painful | 3–8 min — acceptable |
+| **Multilingual quality** | Highest | ~3–5% below large |
+| **MTEB retrieval rank** | Top tier | Strong — within acceptable range |
+| **pod memory at 4–8 GB limit** | Fits with GPU pod | Fits comfortably on CPU pod |
+
+Both models use the same `query: ` / `passage: ` instruction prefix behavior.
+Zero code changes between profiles except the model name and the vector dimension.
+
+### The Vector Dimension Is Schema-Bound
+
+**This is the critical implication.** The Postgres `vector(N)` column dimension
+must match the active model. You cannot mix them.
+
+| EMBEDDING_PROFILE | vector column | IVFFlat index |
+|---|---|---|
+| `gpu` | `vector(1024)` | `lists = 100` |
+| `cpu` | `vector(768)` | `lists = 100` |
+
+If the existing schema has the wrong dimension, it must be migrated before any
+embedding code runs. Check the current schema first. If `EMBEDDING_PROFILE` is
+not set, default to `cpu` (safer assumption for on-prem OCP without confirmed GPU).
+
+### Implementation Pattern
+
+```python
+import os
+from sentence_transformers import SentenceTransformer
+
+EMBEDDING_PROFILE = os.getenv("EMBEDDING_PROFILE", "cpu")  # default: cpu
+
+EMBEDDING_MODELS = {
+    "gpu": {
+        "model_name": "intfloat/multilingual-e5-large",
+        "dimensions": 1024,
+    },
+    "cpu": {
+        "model_name": "intfloat/multilingual-e5-base",
+        "dimensions": 768,
+    },
+}
+
+profile = EMBEDDING_MODELS[EMBEDDING_PROFILE]
+EMBEDDING_MODEL_NAME = profile["model_name"]
+EMBEDDING_DIMENSIONS  = profile["dimensions"]
+
+embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+def embed_query(text: str) -> list[float]:
+    """Embed a user query. Must use 'query: ' prefix for e5 models."""
+    return embedding_model.encode(
+        f"query: {text}",
+        normalize_embeddings=True
+    ).tolist()
+
+def embed_document(text: str) -> list[float]:
+    """Embed a document chunk. Must use 'passage: ' prefix for e5 models."""
+    return embedding_model.encode(
+        f"passage: {text}",
+        normalize_embeddings=True
+    ).tolist()
+```
+
+### OCP Pod Scheduling — GPU Path
+
+If `EMBEDDING_PROFILE=gpu`, the embedding service pod **must** be scheduled
+on a GPU node. Without this, it silently falls back to CPU and you get the
+slow performance the GPU profile was chosen to avoid.
+
+```yaml
+# Embedding service Deployment — GPU path only
+spec:
+  template:
+    spec:
+      nodeSelector:
+        nvidia.com/gpu: "true"          # adjust label to match your cluster
+      tolerations:
+        - key: nvidia.com/gpu
+          operator: Exists
+          effect: NoSchedule
+      containers:
+        - name: embedding-service
+          resources:
+            limits:
+              nvidia.com/gpu: "1"
+              memory: "6Gi"
+            requests:
+              nvidia.com/gpu: "1"
+              memory: "4Gi"
+```
+
+For `EMBEDDING_PROFILE=cpu`, remove `nodeSelector`, `tolerations`, and GPU
+resource limits. Set memory `requests: 2Gi` / `limits: 4Gi`.
+
+The RAG API, MCP Server, and Ingestion pods do **not** need GPU nodes regardless
+of the embedding profile — they call the embedding service, they do not run the
+model themselves.
 
 ---
 
 ## The Experiment — What the Code Must Prove
 
 > **HYPOTHESIS:** An LLM Gateway running on Ollama (llama3.1) can enrich a raw
-> user query, route it to an RLS-scoped RAG layer over ingested emails stored in
-> Postgres (no FTS, encrypted OCP PVC), retrieve the most relevant records via
-> semantic search using `intfloat/multilingual-e5-large` embeddings and structured
-> metadata filters, and return a structured executive-level report — accessible
-> via both an MCP tool interface and a REST API.
+> user query, route it to an RLS-scoped RAG layer over ingested multilingual emails
+> stored in Postgres (no FTS, encrypted OCP PVC, RWX), retrieve the most relevant
+> records via semantic search using `intfloat/multilingual-e5-large` or
+> `intfloat/multilingual-e5-base` (profile-dependent) and structured metadata
+> filters, and return a structured executive-level report — accessible via both
+> an MCP tool interface and a REST API — with zero external API calls at any stage.
 
 ### Five Success Criteria
 
-The experiment is proven when all five pass. These are the acceptance tests for
-the refactored code:
+The experiment is proven when all five pass:
 
 ```
 SC-1  "What's the status of Konek ID?"
@@ -59,19 +178,19 @@ SC-1  "What's the status of Konek ID?"
         retrieved chunks, with correct sender and date attribution.
 
 SC-2  Executive report generated from SC-1 retrieval matches the fixed template
-      structure exactly: Executive Summary, Key Findings, Source Emails table,
-      Status Timeline, Retrieval Note. Generated by llama3.1 via Ollama.
+      exactly: Executive Summary, Key Findings, Source Emails table, Status
+      Timeline, Open Items, Retrieval Note. Generated by llama3.1 via Ollama.
 
-SC-3  MCP tool `report_generation` called from an MCP client (Cursor or Claude Code)
+SC-3  MCP tool report_generation called from an MCP client (Cursor or Claude Code)
       returns the same report as the REST API endpoint for the same query.
 
 SC-4  User A cannot retrieve User B's emails under any query, tool, or API call.
-      RLS must be verifiable — test with two seeded users and confirm zero
-      cross-contamination in results.
+      Verifiable: seed two users, run cross-user queries, confirm zero results
+      from the other user's corpus in all cases.
 
-SC-5  No external API call is made during any retrieval or generation step.
-      All embedding (intfloat/multilingual-e5-large) and all LLM calls (llama3.1)
-      are routed to local services only. Verifiable via network trace or mock.
+SC-5  No external API call is made at any point during retrieval or generation.
+      All embedding and LLM calls route to internal OCP services only.
+      Verifiable via network trace, mock, or log inspection.
 ```
 
 ---
@@ -79,85 +198,81 @@ SC-5  No external API call is made during any retrieval or generation step.
 ## System Architecture — MVP
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                         OCP Cluster                              │
-│                                                                  │
-│  ┌─────────────────────────────────────────────────────────┐    │
-│  │                  Postgres Instance                       │    │
-│  │      (StatefulSet — OCP PVC RWX, encrypted class)        │    │
-│  │                                                          │    │
-│  │   ┌────────────────────────┐  ┌──────────────────────┐  │    │
-│  │   │    Metadata Tables      │  │   pgvector Tables     │  │    │
-│  │   │  emails                 │  │  email_embeddings     │  │    │
-│  │   │  email_chunks           │  │   - chunk_id          │  │    │
-│  │   │  (RLS on user_id)       │  │   - user_id  (RLS)    │  │    │
-│  │   │                        │  │   - vector(1024)  ←   │  │    │
-│  │   └────────────────────────┘  │     multilingual-e5   │  │    │
-│  │                               └──────────────────────┘  │    │
-│  │          ↑  Dual write — single Postgres transaction ↑   │    │
-│  └─────────────────────────────────────────────────────────┘    │
-│                                                                  │
-│  ┌──────────────┐  ┌──────────────────┐  ┌───────────────────┐  │
-│  │  RAG API     │  │  Ingestion Svc   │  │  MCP Server       │  │
-│  │  (FastAPI)   │  │  (OCP CronJob /  │  │  (stdio + SSE)    │  │
-│  │              │  │  triggered Job)  │  │                   │  │
-│  └──────┬───────┘  └────────┬─────────┘  └────────┬──────────┘  │
-│         │                   │                      │             │
-│         └───────────────────┴──────────────────────┘             │
-│                             │                                    │
-│         ┌───────────────────┴──────────────────────┐             │
-│         │                                          │             │
-│  ┌──────▼───────┐                       ┌──────────▼──────────┐  │
-│  │  Ollama      │                       │  sentence-transformers│ │
-│  │  llama3.1    │                       │  multilingual-e5-large│ │
-│  │  (all LLM    │                       │  (all embeddings —  │  │
-│  │   calls)     │                       │   1024-dim)         │  │
-│  └──────────────┘                       └─────────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────────┐
+│                           OCP Cluster                               │
+│                                                                     │
+│  ┌──────────────────────────────────────────────────────────────┐   │
+│  │                     Postgres Instance                         │   │
+│  │        (StatefulSet — OCP PVC RWX, encrypted class)           │   │
+│  │                                                               │   │
+│  │   ┌──────────────────────────┐  ┌─────────────────────────┐  │   │
+│  │   │     Metadata Tables       │  │    pgvector Tables       │  │   │
+│  │   │   emails                  │  │   email_embeddings       │  │   │
+│  │   │   email_chunks            │  │    - chunk_id            │  │   │
+│  │   │   (RLS on user_id)        │  │    - user_id  (RLS)      │  │   │
+│  │   │                          │  │    - vector(1024|768) ←  │  │   │
+│  │   └──────────────────────────┘  │      profile-dependent   │  │   │
+│  │                                 └─────────────────────────┘  │   │
+│  │           ↑  Dual write — single Postgres transaction  ↑      │   │
+│  └──────────────────────────────────────────────────────────────┘   │
+│                                                                     │
+│  ┌─────────────┐  ┌──────────────────┐  ┌──────────────────────┐   │
+│  │  RAG API    │  │  Ingestion Svc   │  │  MCP Server          │   │
+│  │  (FastAPI)  │  │  (OCP CronJob /  │  │  (stdio + HTTP/SSE)  │   │
+│  │             │  │  triggered Job)  │  │                      │   │
+│  └──────┬──────┘  └───────┬──────────┘  └──────────┬───────────┘   │
+│         │                 │                         │               │
+│         └─────────────────┴─────────────────────────┘               │
+│                           │                                         │
+│            ┌──────────────┴──────────────┐                          │
+│            │                             │                          │
+│   ┌────────▼────────┐        ┌───────────▼────────────────────┐     │
+│   │  Ollama         │        │  Embedding Service              │     │
+│   │  llama3.1       │        │  sentence-transformers          │     │
+│   │                 │        │                                 │     │
+│   │  ALL LLM calls: │        │  GPU path: multilingual-e5-large│     │
+│   │  - enrichment   │        │            vector(1024)         │     │
+│   │  - tag extract  │        │                                 │     │
+│   │  - prefix gen   │        │  CPU path: multilingual-e5-base │     │
+│   │  - report gen   │        │            vector(768)          │     │
+│   └─────────────────┘        └─────────────────────────────────┘     │
+│                                                                     │
+│   ── Nothing exits the cluster. Zero external API calls. ──         │
+└─────────────────────────────────────────────────────────────────────┘
 ```
-
-**Everything runs inside the cluster. No external API calls. Ever.**
 
 ---
 
 ## Models — Exact Specifications
 
-### Embedding: `intfloat/multilingual-e5-large`
-
-```python
-from sentence_transformers import SentenceTransformer
-
-model = SentenceTransformer("intfloat/multilingual-e5-large")
-
-# CRITICAL: This model requires a task prefix on input text.
-# Queries must be prefixed with "query: "
-# Documents (chunks) must be prefixed with "passage: "
-# Omitting the prefix silently degrades retrieval quality.
-
-# At query time:
-query_embedding = model.encode("query: What's the status of Konek ID?")
-# → 1024-dimensional float32 vector
-
-# At ingestion time:
-chunk_embedding = model.encode("passage: [PROJECT: Konek ID] ... email text ...")
-# → 1024-dimensional float32 vector
-```
-
-**Dimension:** 1024 — the pgvector column must be `vector(1024)` exactly.
-
-**The prefix requirement is mandatory.** `intfloat/e5` models are trained with
-instruction prefixes. Skipping them produces lower-quality embeddings that hurt
-retrieval. Check every `model.encode()` call in the codebase — if the prefix
-is missing, add it.
-
 ### LLM: Ollama `llama3.1`
 
 ```python
+import os
 import httpx
 
-OLLAMA_BASE_URL = "http://ollama-service:11434"  # internal OCP service URL
+OLLAMA_BASE_URL = os.getenv("OLLAMA_BASE_URL", "http://ollama-service:11434")
 
-async def ollama_generate(prompt: str, system: str = "") -> str:
+async def ollama_chat(messages: list[dict], temperature: float = 0.1) -> str:
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{OLLAMA_BASE_URL}/api/chat",
+            json={
+                "model": "llama3.1",
+                "messages": messages,
+                "stream": False,
+                "options": {
+                    "temperature": temperature,
+                    "num_predict": 1024
+                }
+            },
+            timeout=60.0
+        )
+        response.raise_for_status()
+        return response.json()["message"]["content"]
+
+async def ollama_generate(prompt: str, system: str = "",
+                          temperature: float = 0.1) -> str:
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{OLLAMA_BASE_URL}/api/generate",
@@ -167,271 +282,280 @@ async def ollama_generate(prompt: str, system: str = "") -> str:
                 "system": system,
                 "stream": False,
                 "options": {
-                    "temperature": 0.1,   # low temp for structured outputs
-                    "num_predict": 1024
+                    "temperature": temperature,
+                    "num_predict": 2048
                 }
             },
-            timeout=60.0
+            timeout=90.0
         )
+        response.raise_for_status()
         return response.json()["response"]
-
-# For chat-style calls (enrichment, tag extraction):
-async def ollama_chat(messages: list[dict]) -> str:
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{OLLAMA_BASE_URL}/api/chat",
-            json={
-                "model": "llama3.1",
-                "messages": messages,
-                "stream": False,
-                "options": {"temperature": 0.1}
-            },
-            timeout=60.0
-        )
-        return response.json()["message"]["content"]
 ```
 
-**All three LLM use cases route to Ollama:**
+**Temperature settings by use case:**
 
-| Use Case | Prompt Style | Temperature |
+| Use Case | Call Style | Temperature |
 |---|---|---|
-| Tag extraction at ingestion | Chat, JSON output enforced | 0.0 |
-| Contextual prefix generation at ingestion | Chat, structured prose | 0.1 |
-| Query enrichment (Gateway) | Chat, JSON output enforced | 0.1 |
-| Executive report generation | Generate, fixed template | 0.2 |
+| Tag extraction (ingestion) | chat, JSON output | 0.0 |
+| Contextual prefix generation (ingestion) | chat, structured prose | 0.1 |
+| Query enrichment (Gateway) | chat, JSON output | 0.1 |
+| HyDE document generation | generate | 0.2 |
+| Executive report generation | generate, fixed template | 0.2 |
+
+### Embedding: Profile-Dependent (see Model Selection section above)
+
+```python
+# CRITICAL: intfloat/e5 models require instruction prefixes.
+# Omitting them silently degrades retrieval quality — no error is thrown.
+
+def embed_query(text: str) -> list[float]:
+    # "query: " prefix required for all query-time embeddings
+    return embedding_model.encode(
+        f"query: {text}",
+        normalize_embeddings=True   # required for pgvector cosine (<=>)
+    ).tolist()
+
+def embed_document(text: str) -> list[float]:
+    # "passage: " prefix required for all document/chunk embeddings
+    return embedding_model.encode(
+        f"passage: {text}",
+        normalize_embeddings=True
+    ).tolist()
+```
+
+**Check every `model.encode()` call in the codebase.** If the `query: ` or
+`passage: ` prefix is missing, add it. This is the most common mistake with
+this model family.
 
 ---
 
 ## Database Schema — Authoritative
 
-Any schema in the existing code that differs from this must be migrated to match.
-The vector column dimension `1024` is derived from `multilingual-e5-large` and is
-non-negotiable.
+Any schema in the existing code that differs from this must be migrated.
+The vector dimension is determined by `EMBEDDING_PROFILE` — check the env
+var before deciding which dimension to use.
 
 ```sql
--- ─────────────────────────────────────────────
 -- Enable pgvector
--- ─────────────────────────────────────────────
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- ─────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────
 -- emails — metadata table
--- ─────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS emails (
     message_id          TEXT PRIMARY KEY,
     thread_id           TEXT,
-    user_id             TEXT NOT NULL,          -- RLS enforcement key
+    user_id             TEXT NOT NULL,        -- RLS enforcement key
 
-    -- Sender/recipient: stored for display and filtering, NEVER text-searched
+    -- Stored for display and structured filtering ONLY.
+    -- NEVER used as a full-text search target.
     from_email          TEXT NOT NULL,
     from_name           TEXT,
     to_emails           JSONB,
     cc_emails           JSONB,
-
-    -- Temporal: indexed for date-range filters
     sent_at             TIMESTAMPTZ NOT NULL,
+    subject             TEXT,                 -- display/attribution only, no FTS
 
-    -- Subject: stored for display and attribution ONLY
-    -- NO full-text index. NO LIKE queries against this column.
-    subject             TEXT,
+    -- Extracted structured tags — populated by llama3.1 at ingestion.
+    -- These columns replace BM25 keyword matching. Must be indexed.
+    project_names       JSONB,                -- ["Konek ID"]
+    person_mentions     JSONB,                -- ["Kevin Sivaperumal"]
+    cycle_references    JSONB,                -- ["Cycle 2", "Preauth"]
+    status_keywords     JSONB,                -- ["completed", "in progress"]
+    email_type          TEXT,                 -- status_report | meeting_invite |
+                                              --   action_item | fyi | other
+    urgency             TEXT,                 -- high | medium | low
 
-    -- Extracted structured tags (indexed — replace BM25 keyword matching)
-    -- Populated by llama3.1 at ingestion time, never by regex or LIKE
-    project_names       JSONB,                  -- ["Konek ID"]
-    person_mentions     JSONB,                  -- ["Kevin Sivaperumal"]
-    cycle_references    JSONB,                  -- ["Cycle 2", "Preauth"]
-    status_keywords     JSONB,                  -- ["completed", "in progress"]
-    email_type          TEXT,                   -- status_report | meeting_invite |
-                                                --   action_item | fyi | other
-    urgency             TEXT,                   -- high | medium | low
-
-    -- Contextual prefix used at ingestion to build the embedding.
-    -- Stored for debugging and re-ingestion only.
-    -- NEVER queried for text search.
+    -- Stored for debug and re-ingestion only. Never queried for text search.
     llm_context_prefix  TEXT,
 
     ingested_at         TIMESTAMPTZ DEFAULT NOW()
 );
 
--- ─────────────────────────────────────────────
--- email_chunks — chunked content
--- ─────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────
+-- email_chunks
+-- ─────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS email_chunks (
     chunk_id            TEXT PRIMARY KEY,
     message_id          TEXT NOT NULL REFERENCES emails(message_id) ON DELETE CASCADE,
     user_id             TEXT NOT NULL,
     chunk_index         INTEGER NOT NULL,
-    chunk_text          TEXT NOT NULL,          -- stored for display, NOT FTS indexed
+    chunk_text          TEXT NOT NULL,        -- stored for display, NOT FTS indexed
     token_count         INTEGER,
     UNIQUE (message_id, chunk_index)
 );
 
--- ─────────────────────────────────────────────
--- email_embeddings — vector store (dual-copy)
--- vector(1024) = intfloat/multilingual-e5-large
--- ─────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────
+-- email_embeddings — vector store (dual-copy with metadata)
+--
+-- DIMENSION IS PROFILE-DEPENDENT:
+--   EMBEDDING_PROFILE=gpu  →  vector(1024)   multilingual-e5-large
+--   EMBEDDING_PROFILE=cpu  →  vector(768)    multilingual-e5-base
+--
+-- The application must read EMBEDDING_PROFILE and create/migrate
+-- this table with the correct dimension before any ingestion runs.
+-- ─────────────────────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS email_embeddings (
-    chunk_id            TEXT PRIMARY KEY REFERENCES email_chunks(chunk_id) ON DELETE CASCADE,
+    chunk_id            TEXT PRIMARY KEY
+                            REFERENCES email_chunks(chunk_id) ON DELETE CASCADE,
     user_id             TEXT NOT NULL,
-    embedding           vector(1024)            -- MUST be 1024 for multilingual-e5-large
+    embedding           vector(1024)          -- GPU path default
+                                              -- change to vector(768) for CPU path
 );
 
--- ─────────────────────────────────────────────
--- Indexes
--- ─────────────────────────────────────────────
-
--- Vector index (IVFFlat — tune lists based on dataset size)
+-- Vector index
 CREATE INDEX IF NOT EXISTS idx_embeddings_vector
     ON email_embeddings
     USING ivfflat (embedding vector_cosine_ops)
     WITH (lists = 100);
 
--- Structured filter indexes (these replace BM25 — must exist)
+-- Structured filter indexes — these replace BM25, they must exist
 CREATE INDEX IF NOT EXISTS idx_emails_user_sent
     ON emails (user_id, sent_at DESC);
-
 CREATE INDEX IF NOT EXISTS idx_emails_project_names
     ON emails USING gin (project_names);
-
 CREATE INDEX IF NOT EXISTS idx_emails_person_mentions
     ON emails USING gin (person_mentions);
-
-CREATE INDEX IF NOT EXISTS idx_emails_email_type
+CREATE INDEX IF NOT EXISTS idx_emails_type
     ON emails (user_id, email_type);
-
 CREATE INDEX IF NOT EXISTS idx_chunks_message
     ON email_chunks (message_id);
-
 CREATE INDEX IF NOT EXISTS idx_embeddings_user
     ON email_embeddings (user_id);
 
--- ─────────────────────────────────────────────
--- Row-Level Security
--- Applied to ALL user-data tables
--- ─────────────────────────────────────────────
+-- ─────────────────────────────────────────────────────────
+-- Row-Level Security — applied to ALL user-data tables
+-- ─────────────────────────────────────────────────────────
 ALTER TABLE emails           ENABLE ROW LEVEL SECURITY;
 ALTER TABLE email_chunks     ENABLE ROW LEVEL SECURITY;
 ALTER TABLE email_embeddings ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY user_isolation_emails ON emails
     USING (user_id = current_setting('app.current_user_id')::text);
-
 CREATE POLICY user_isolation_chunks ON email_chunks
     USING (user_id = current_setting('app.current_user_id')::text);
-
 CREATE POLICY user_isolation_embeddings ON email_embeddings
     USING (user_id = current_setting('app.current_user_id')::text);
 
--- Application MUST execute this before any query in a session:
--- SET LOCAL app.current_user_id = '{authenticated_user_id}';
--- Failure to set this will cause the policy to throw an error — intentional.
+-- The application MUST execute this before any query in a request:
+--   SET LOCAL app.current_user_id = '{authenticated_user_id}';
+-- Failure to set this causes the policy to throw an error — intentional.
 ```
 
 ---
 
 ## Ingestion Pipeline — Required Behavior
 
-The ingestion service must perform these steps in order for every email.
-If the existing code skips any step, add it.
+Every step must be present for every email. If the existing code skips any step, add it.
 
-### Step 1: Tag Extraction (llama3.1 via Ollama)
+### Step 1: Tag Extraction (llama3.1 → Ollama, temperature 0.0)
 
 ```python
-TAG_EXTRACTION_PROMPT = """
-You are extracting structured metadata from an email.
-Return ONLY a valid JSON object. No explanation. No markdown. No extra text.
+TAG_EXTRACTION_SYSTEM = (
+    "You are extracting structured metadata from an email. "
+    "Return ONLY a valid JSON object. No explanation. No markdown. No extra text."
+)
 
-{
-  "project_names": [],
-  "person_mentions": [],
+TAG_EXTRACTION_PROMPT = """
+Extract from the email below. Return exactly this JSON structure:
+{{
+  "project_names":    [],
+  "person_mentions":  [],
   "cycle_references": [],
-  "status_keywords": [],
-  "email_type": "",
-  "urgency": ""
-}
+  "status_keywords":  [],
+  "email_type":       "",
+  "urgency":          ""
+}}
 
 Rules:
-- project_names: exact project names as they appear in the text
-- person_mentions: full names only, no email addresses
+- project_names:    exact project names as they appear in the text
+- person_mentions:  full names only, no email addresses
 - cycle_references: testing cycles, sprint numbers, version strings
-- status_keywords: status terms only — completed, blocked, in progress, pending, etc.
-- email_type: exactly one of: status_report | meeting_invite | action_item | fyi | other
-- urgency: exactly one of: high | medium | low
+- status_keywords:  completed | blocked | in progress | pending | escalated | etc.
+- email_type:       one of: status_report | meeting_invite | action_item | fyi | other
+- urgency:          one of: high | medium | low
+
+Email:
+{email_text}
 """
 ```
 
-### Step 2: Contextual Prefix Generation (llama3.1 via Ollama)
+### Step 2: Contextual Prefix Generation (llama3.1 → Ollama, temperature 0.1)
 
-The prefix is prepended to the chunk text **before** embedding. This is the most
-critical ingestion step for retrieval quality under the no-FTS constraint.
+The prefix is prepended to the chunk text **before** embedding. This is the
+most critical ingestion step for retrieval quality under the no-FTS constraint.
+It encodes what BM25 would have caught lexically into the embedding vector.
 
 ```python
-CONTEXT_PREFIX_TEMPLATE = """
-[PROJECT: {project_names}] [FROM: {from_name}] [DATE: {sent_at}]
-[TYPE: {email_type}] [STATUS: {status_keywords}] [CYCLE: {cycle_references}]
-[DIST: {recipient_count} recipients]
-Summary: {llm_generated_one_sentence_summary}
----
-{chunk_text}
-"""
+CONTEXT_PREFIX_TEMPLATE = (
+    "[PROJECT: {project_names}] "
+    "[FROM: {from_name}] "
+    "[DATE: {sent_at}] "
+    "[TYPE: {email_type}] "
+    "[STATUS: {status_keywords}] "
+    "[CYCLE: {cycle_references}] "
+    "[DIST: {recipient_count} recipients]\n"
+    "Summary: {llm_one_sentence_summary}\n"
+    "---\n"
+    "{chunk_text}"
+)
 ```
 
-The `llm_generated_one_sentence_summary` is a separate Ollama call asking llama3.1
-to summarize the email in one sentence. It becomes part of the prefix stored in
-`llm_context_prefix`.
+The `llm_one_sentence_summary` is a separate Ollama call asking llama3.1 to
+summarize the email in one sentence. The full prefix is stored in
+`llm_context_prefix` for debugging and re-ingestion.
 
 ### Step 3: Chunking
 
-```python
-CHUNK_SIZE_TOKENS  = 512
+```
+CHUNK_SIZE_TOKENS   = 512
 CHUNK_OVERLAP_TOKENS = 64
 ```
 
-Split by: section headers first (if structured email), then by message boundary
-(for threads), then by token count with overlap. Use `tiktoken` or character
-approximation (1 token ≈ 4 chars) if a tokenizer is not available.
+Split order: section headers first (structured emails) → message boundaries
+(threads) → token count with overlap. Approximate: 1 token ≈ 4 characters if
+a tokenizer is unavailable.
 
-### Step 4: Embedding (intfloat/multilingual-e5-large)
+### Step 4: Embedding
 
 ```python
-# Input to embed = contextual_prefix + chunk_text
-# MUST use "passage: " prefix for document embeddings
+# Input = contextual_prefix + chunk_text (already concatenated in prefix template)
+# MUST use "passage: " prefix — this is a document, not a query
 
-full_text = f"passage: {context_prefix}\n{chunk_text}"
-embedding = model.encode(full_text, normalize_embeddings=True)
-# → numpy array, shape (1024,)
-# normalize_embeddings=True required for cosine similarity with pgvector <=>
+full_text  = f"passage: {context_prefix}"   # prefix already contains chunk_text
+embedding  = embed_document(full_text)       # normalize_embeddings=True inside
+# → list of floats, length = EMBEDDING_DIMENSIONS (1024 or 768)
 ```
 
-### Step 5: Atomic Write to Postgres
+### Step 5: Atomic Write
 
 ```python
 async with db.transaction():
     await db.execute(INSERT_EMAIL_SQL, email_metadata)
     for chunk in chunks:
-        await db.execute(INSERT_CHUNK_SQL, chunk)
-        await db.execute(INSERT_EMBEDDING_SQL, chunk_id, user_id, embedding.tolist())
+        await db.execute(INSERT_CHUNK_SQL, chunk_data)
+        await db.execute(INSERT_EMBEDDING_SQL,
+                         chunk.chunk_id, user_id, chunk.embedding)
 # If any step fails, the whole transaction rolls back.
-# No partial ingestion state.
+# No partial ingestion state ever.
 ```
 
 ---
 
 ## Query Enrichment — LLM Gateway
 
-Every call to `search` and `full_rag` must pass through the enrichment step first.
-The enrichment call goes to **Ollama llama3.1**.
-
-### Enrichment Prompt
+Every `search` and `full_rag` call passes through enrichment first.
+The enrichment call goes to **Ollama llama3.1**, temperature 0.1.
 
 ```python
-ENRICHMENT_SYSTEM = """
-You are a query enrichment assistant for an email search system.
-Return ONLY a valid JSON object. No explanation. No markdown.
-"""
+ENRICHMENT_SYSTEM = (
+    "You are a query enrichment assistant for a multilingual email search system. "
+    "Emails may be in English, French, Spanish, or other languages. "
+    "Return ONLY a valid JSON object. No explanation. No markdown."
+)
 
 ENRICHMENT_PROMPT = """
-Enrich this user query for semantic email search.
+Enrich this user query for semantic email retrieval.
 
 User query: "{raw_query}"
 
@@ -440,86 +564,80 @@ Return:
   "rewritten_query": "...",
   "semantic_variants": ["...", "...", "...", "..."],
   "metadata_filters": {{
-    "project_names": [],
-    "date_range": {{"from": null, "to": null}},
-    "email_type": [],
-    "person_mentions": []
+    "project_names":    [],
+    "date_range":       {{"from": null, "to": null}},
+    "email_type":       [],
+    "person_mentions":  []
   }},
   "query_type": "status | search | summary",
   "hyde_prompt": "Write an email that would perfectly answer: {raw_query}"
 }}
 
 Rules:
-- semantic_variants: exactly 4 alternative phrasings of the same intent
+- semantic_variants: exactly 4 alternative phrasings, may include French/Spanish
+  equivalents if the query implies multilingual content
 - metadata_filters: only populate fields explicitly mentioned or strongly implied
-- hyde_prompt: write a prompt that would generate the ideal email to answer the query
-- query_type: status = project status questions, search = general lookup, summary = synthesis
+- hyde_prompt: a prompt to generate the ideal email answering this query
+- query_type: status = project status questions | search = general lookup |
+              summary = synthesis across emails
 """
 ```
 
-### HyDE Step
-
-After enrichment, generate the hypothetical document:
+After enrichment, generate the HyDE embedding:
 
 ```python
-# Call Ollama with hyde_prompt → get a hypothetical email text
-# Embed it with "passage: " prefix (it's a document, not a query)
-hyde_text = await ollama_generate(enrichment.hyde_prompt)
-hyde_embedding = model.encode(f"passage: {hyde_text}", normalize_embeddings=True)
+hyde_text      = await ollama_generate(enrichment.hyde_prompt, temperature=0.2)
+hyde_embedding = embed_document(f"passage: {hyde_text}")
+# Note: passage: prefix — HyDE text is treated as a document
 ```
 
 ---
 
 ## Retrieval Pipeline — `full_rag`
 
-This is the core of the experiment. Every step must be present in the code.
+Every step must be present. If any step is missing, add it.
 
 ```python
 async def full_rag(raw_query: str, user_id: str) -> RagResult:
 
-    # 1. Enrichment
-    enrichment = await enrich_query(raw_query)          # llama3.1 via Ollama
+    # Step 1 — Enrichment
+    enrichment     = await enrich_query(raw_query)           # llama3.1 via Ollama
     hyde_embedding = await generate_hyde_embedding(enrichment.hyde_prompt)
 
-    # 2. Metadata pre-filter candidates
-    #    Structured WHERE clauses only — no text search
+    # Step 2 — Metadata pre-filter
+    # Structured WHERE clauses only — no text search of any kind
     candidate_ids = await metadata_prefilter(
         user_id=user_id,
-        filters=enrichment.metadata_filters             # project_names, date_range, etc.
+        filters=enrichment.metadata_filters
     )
-    # candidate_ids scopes all subsequent vector searches
+    # candidate_ids scopes ALL subsequent vector searches to this user's
+    # filtered subset. If no filters apply, candidate_ids = all user's chunks.
 
-    # 3. Multi-variant semantic search
-    #    One pgvector query per embedding, all scoped to candidate_ids
-    all_queries = [enrichment.rewritten_query] + enrichment.semantic_variants
-    all_embeddings = model.encode(
-        [f"query: {q}" for q in all_queries],
-        normalize_embeddings=True
-    )
-    all_embeddings.append(hyde_embedding)               # include HyDE
+    # Step 3 — Multi-variant semantic search
+    all_query_texts = [enrichment.rewritten_query] + enrichment.semantic_variants
+    all_embeddings  = [embed_query(q) for q in all_query_texts]
+    all_embeddings.append(hyde_embedding)   # HyDE is a passage embedding
 
     result_sets = []
     for emb in all_embeddings:
         results = await vector_search(
             embedding=emb,
             user_id=user_id,
-            candidate_ids=candidate_ids,                # pre-filtered scope
+            candidate_ids=candidate_ids,
             top_k=20
         )
         result_sets.append(results)
 
-    # 4. RRF fusion
-    #    score(d) = Σ 1/(60 + rank_i(d)) across all result sets
+    # Step 4 — RRF fusion across all variant result sets
     fused = reciprocal_rank_fusion(result_sets, k=60)   # → top-50
 
-    # 5. Reranking
-    #    cross-encoder/ms-marco-MiniLM-L-6-v2 (local)
+    # Step 5 — Reranking (local cross-encoder)
     reranked = reranker.rerank(
         query=raw_query,
         documents=[r.chunk_text for r in fused[:50]]
     )                                                   # → top-5
 
-    # 6. Report generation
+    # Step 6 — Report generation
     report = await generate_report(
         query=raw_query,
         chunks=reranked[:5],
@@ -532,9 +650,7 @@ async def full_rag(raw_query: str, user_id: str) -> RagResult:
 ### Vector Search SQL
 
 ```sql
--- Called once per query variant, scoped to pre-filtered candidate_ids
--- SET LOCAL app.current_user_id already set before this executes
-
+-- SET LOCAL app.current_user_id already executed before this query
 SELECT
     ec.chunk_id,
     ec.chunk_text,
@@ -543,11 +659,11 @@ SELECT
     e.sent_at,
     e.subject,
     e.email_type,
-    ee.embedding <=> $1::vector  AS distance
+    ee.embedding <=> $1::vector AS distance
 FROM email_embeddings ee
-JOIN email_chunks ec ON ee.chunk_id = ec.chunk_id
-JOIN emails      e  ON ec.message_id = e.message_id
-WHERE ee.chunk_id = ANY($2::text[])   -- $2 = pre-filtered candidate_ids
+JOIN email_chunks ec ON ee.chunk_id  = ec.chunk_id
+JOIN emails       e  ON ec.message_id = e.message_id
+WHERE ee.chunk_id = ANY($2::text[])    -- $2 = pre-filtered candidate_ids
 ORDER BY distance
 LIMIT 20;
 ```
@@ -559,131 +675,18 @@ def reciprocal_rank_fusion(
     result_sets: list[list[SearchResult]],
     k: int = 60
 ) -> list[SearchResult]:
-    scores: dict[str, float] = {}
+    scores: dict[str, float]        = {}
     docs:   dict[str, SearchResult] = {}
 
     for result_set in result_sets:
         for rank, result in enumerate(result_set):
-            scores[result.chunk_id] = scores.get(result.chunk_id, 0.0) + 1.0 / (k + rank + 1)
+            scores[result.chunk_id] = (
+                scores.get(result.chunk_id, 0.0) + 1.0 / (k + rank + 1)
+            )
             docs[result.chunk_id] = result
 
-    ranked = sorted(scores.keys(), key=lambda cid: scores[cid], reverse=True)
+    ranked = sorted(scores, key=lambda cid: scores[cid], reverse=True)
     return [docs[cid] for cid in ranked[:50]]
-```
-
----
-
-## The Four MCP Tools
-
-### Tool: `email_query`
-
-```python
-@mcp.tool(
-    name="email_query",
-    description="""Use when you know specific structured attributes of the email:
-    sender name/email, date range, project name, or email type. Fast metadata-only
-    lookup. Does NOT search email text or subject. No LLM involved.
-    Example: 'All status reports from Kevin about Konek ID in September 2025'"""
-)
-async def email_query(
-    project_names: list[str] | None = None,
-    from_email: str | None = None,
-    email_type: str | None = None,
-    date_from: str | None = None,
-    date_to: str | None = None,
-    person_mentions: list[str] | None = None,
-    limit: int = 10
-) -> list[EmailRecord]:
-    # Pure structured SQL — no embeddings, no LLM, no text search
-    ...
-```
-
-### Tool: `search`
-
-```python
-@mcp.tool(
-    name="search",
-    description="""Use for natural language questions about email content when you
-    don't know the specific sender or date. Finds emails with similar meaning even
-    with different words. Uses semantic search only.
-    Example: 'emails discussing testing delays or stakeholder concerns'"""
-)
-async def search(
-    query: str,
-    top_k: int = 10
-) -> list[ChunkResult]:
-    # Enrichment → single embedding → pgvector search → return chunks
-    ...
-```
-
-### Tool: `full_rag`
-
-```python
-@mcp.tool(
-    name="full_rag",
-    description="""Use for complex questions requiring synthesis across multiple
-    emails, or when search returns poor results. Highest accuracy. Slower (2-5s).
-    Runs query enrichment, multi-variant semantic search, RRF fusion, and reranking.
-    Example: 'What is the overall status of the Konek ID project?'"""
-)
-async def full_rag_tool(query: str) -> RagResult:
-    # Full pipeline as defined in the Retrieval Pipeline section above
-    ...
-```
-
-### Tool: `report_generation`
-
-```python
-@mcp.tool(
-    name="report_generation",
-    description="""Use when the user explicitly wants an executive report or
-    structured status briefing. Produces a fixed-format report with executive
-    summary, key findings, source attribution, and timeline.
-    Example: 'Generate a status report on Konek ID for executive review'"""
-)
-async def report_generation(query: str) -> ExecutiveReport:
-    # Calls full_rag internally, then formats with the fixed report template
-    ...
-```
-
----
-
-## Executive Report Template — Fixed
-
-The LLM prompt for report generation must enforce this exact structure.
-Do not allow the model to deviate from this format.
-
-```
-SYSTEM PROMPT (verbatim in code):
-"""
-You are an executive communications assistant. Generate a status report using
-ONLY the provided email context. Use the EXACT template below. Do not add
-sections. Do not remove sections. Do not editorialize.
-
-TEMPLATE:
-## Executive Summary
-{2-3 sentences maximum. State what was found and the current status.}
-
-## Key Findings
-- {finding with inline attribution: (Source: Name, Date)}
-- {finding with inline attribution}
-- {finding with inline attribution}
-
-## Source Emails
-| Sender | Date | Type | Key Point |
-|--------|------|------|-----------|
-| {name} | {YYYY-MM-DD} | {type} | {one sentence} |
-
-## Status Timeline
-{Chronological list of events from retrieved emails. Omit if only one email.}
-
-## Open Items
-{Action items or open questions explicitly found in the emails.
-Write 'None identified.' if none are present. Do not infer.}
-
-## Retrieval Note
-Retrieved: {N} emails | Top match: {sender}, {date} | Query: {rewritten_query}
-"""
 ```
 
 ---
@@ -695,14 +698,114 @@ from sentence_transformers import CrossEncoder
 
 reranker = CrossEncoder("cross-encoder/ms-marco-MiniLM-L-6-v2")
 
-def rerank(query: str, documents: list[str]) -> list[tuple[int, float]]:
-    pairs = [(query, doc) for doc in documents]
+def rerank(query: str, documents: list[str], top_k: int = 5) -> list[str]:
+    pairs  = [(query, doc) for doc in documents]
     scores = reranker.predict(pairs)
-    ranked = sorted(enumerate(scores), key=lambda x: x[1], reverse=True)
-    return ranked  # [(original_index, score), ...]
+    ranked = sorted(zip(documents, scores), key=lambda x: x[1], reverse=True)
+    return [doc for doc, _ in ranked[:top_k]]
 ```
 
 **No Cohere. No external reranker API. Local cross-encoder only.**
+
+---
+
+## The Four MCP Tools
+
+### `email_query`
+
+```python
+@mcp.tool(
+    name="email_query",
+    description="""Use when you know specific structured attributes: sender name
+    or email, date range, project name, or email type. Fast metadata-only lookup
+    (<30ms). Does NOT search email text or subject. No LLM involved.
+    Example: 'All status reports from Kevin about Konek ID in September 2025'"""
+)
+async def email_query(
+    project_names:    list[str] | None = None,
+    from_email:       str        | None = None,
+    email_type:       str        | None = None,
+    date_from:        str        | None = None,
+    date_to:          str        | None = None,
+    person_mentions:  list[str]  | None = None,
+    limit:            int               = 10
+) -> list[EmailRecord]: ...
+```
+
+### `search`
+
+```python
+@mcp.tool(
+    name="search",
+    description="""Use for natural language questions about email content when
+    you don't know the specific sender or date. Finds emails with similar meaning
+    even with different words. Supports multilingual queries.
+    Example: 'emails discussing testing delays or stakeholder concerns'"""
+)
+async def search(query: str, top_k: int = 10) -> list[ChunkResult]: ...
+```
+
+### `full_rag`
+
+```python
+@mcp.tool(
+    name="full_rag",
+    description="""Use for complex questions requiring synthesis across multiple
+    emails, or when search returns poor results. Highest accuracy, slower (2-5s).
+    Runs enrichment, multi-variant semantic search, RRF fusion, and reranking.
+    Example: 'What is the overall status of the Konek ID project?'"""
+)
+async def full_rag_tool(query: str) -> RagResult: ...
+```
+
+### `report_generation`
+
+```python
+@mcp.tool(
+    name="report_generation",
+    description="""Use when the user explicitly wants an executive report or
+    structured status briefing. Fixed-format output: executive summary, key
+    findings, source attribution, and timeline.
+    Example: 'Generate a status report on Konek ID for executive review'"""
+)
+async def report_generation(query: str) -> ExecutiveReport: ...
+```
+
+---
+
+## Executive Report Template — Fixed
+
+Enforce this structure in the LLM system prompt. The model must not deviate.
+
+```
+SYSTEM PROMPT (verbatim):
+You are an executive communications assistant. Generate a status report using
+ONLY the provided email context. Use the EXACT template below.
+Do not add sections. Do not remove sections. Do not infer beyond what is stated.
+
+## Executive Summary
+{2-3 sentences maximum. State what was found and the current status.}
+
+## Key Findings
+- {finding — (Source: Name, Date)}
+- {finding — (Source: Name, Date)}
+- {finding — (Source: Name, Date)}
+
+## Source Emails
+| Sender | Date | Type | Key Point |
+|--------|------|------|-----------|
+| {name} | {YYYY-MM-DD} | {type} | {one sentence} |
+
+## Status Timeline
+{Chronological progression from retrieved emails. Omit section if only one email.}
+
+## Open Items
+{Action items or open questions found explicitly in the emails.
+Write 'None identified.' if none are present. Do not infer.}
+
+## Retrieval Note
+Retrieved: {N} emails | Top match: {sender}, {date} | Query: {rewritten_query}
+```
 
 ---
 
@@ -715,149 +818,161 @@ spec:
     - metadata:
         name: postgres-data
       spec:
-        accessModes: ["ReadWriteMany"]            # RWX
-        storageClassName: <encrypted-class-name>  # confirm with platform team
+        accessModes: ["ReadWriteMany"]             # RWX confirmed
+        storageClassName: <encrypted-class-name>   # confirm with platform team
         resources:
           requests:
             storage: 50Gi
 
-# Environment (from OCP Secret — never hardcoded)
+# All pods — secrets from OCP Secret, never hardcoded
 env:
   - name: DATABASE_URL
     valueFrom:
-      secretKeyRef:
-        name: rag-db-secret
-        key: database_url
+      secretKeyRef: { name: rag-db-secret, key: database_url }
   - name: OLLAMA_BASE_URL
-    value: "http://ollama-service:11434"          # internal service — no egress
+    value: "http://ollama-service:11434"    # internal cluster service
+  - name: EMBEDDING_PROFILE
+    value: "gpu"                            # or "cpu" — set per environment
 ```
 
-**Platform team must confirm before PoC starts:**
+**Confirm with platform team before starting:**
 
 | Item | Why It Blocks |
 |---|---|
-| Encrypted storage class name | Without it the PVC cannot be created |
-| pgvector in approved Postgres image | Bitnami Postgres 15+ includes it — verify the image is on the approved list |
-| Ollama service URL inside the cluster | All LLM calls route here — must be reachable from all pods |
-| Network policy for Ollama pod | Ensure RAG API, Ingestion, and MCP Server can reach the Ollama service port |
+| Encrypted storage class name | PVC cannot be created without it |
+| `EMBEDDING_PROFILE` for this cluster | Determines vector dimension — must be set before first ingestion |
+| GPU node label and taint (if `EMBEDDING_PROFILE=gpu`) | Embedding pod must land on GPU node or performance degrades silently |
+| Postgres 15+ with pgvector in approved image list | Bitnami Postgres 15+ includes pgvector — verify approval |
+| Ollama internal service URL and reachability | Every LLM call routes here |
+| Network policy for Ollama pod | RAG API, Ingestion, MCP Server must reach Ollama service port |
 
 ---
 
-## Code Review Checklist for the Agent
-
-Before finishing, verify every item:
+## Code Review Checklist
 
 ```
 Schema
-[ ] vector column is vector(1024) — not 768, not 384, not 1536
-[ ] All three tables have RLS enabled and a user_isolation policy
-[ ] GIN indexes exist on project_names and person_mentions
-[ ] No FTS index (tsvector, GIN on text columns for search) exists anywhere
+[ ] vector column dimension matches EMBEDDING_PROFILE
+    gpu → vector(1024)  |  cpu → vector(768)
+[ ] RLS enabled and user_isolation policy on emails, email_chunks, email_embeddings
+[ ] GIN indexes on project_names and person_mentions
+[ ] No FTS index anywhere (no tsvector, no GIN on text columns for search)
+[ ] No LIKE or ILIKE on subject, chunk_text, or any email content column
 
 Embedding
-[ ] Model loaded is intfloat/multilingual-e5-large
-[ ] Query embeddings use "query: " prefix
-[ ] Document embeddings use "passage: " prefix
-[ ] normalize_embeddings=True on all encode() calls
+[ ] EMBEDDING_PROFILE env var read at startup
+[ ] Correct model loaded: e5-large (gpu) or e5-base (cpu)
+[ ] All query embeddings use "query: " prefix
+[ ] All document/chunk embeddings use "passage: " prefix
+[ ] normalize_embeddings=True on every encode() call
+[ ] embed_query() and embed_document() are separate functions, not one
 
 LLM Calls
 [ ] Every LLM call points to OLLAMA_BASE_URL — zero calls to external APIs
-[ ] Model name is "llama3.1" in every Ollama API call
-[ ] Temperature 0.0-0.1 for structured JSON outputs (tag extraction, enrichment)
-[ ] Temperature 0.2 for report generation
+[ ] Model name is "llama3.1" in every Ollama request body
+[ ] temperature 0.0 for tag extraction
+[ ] temperature 0.1 for query enrichment and prefix generation
+[ ] temperature 0.2 for HyDE and report generation
 
 Ingestion
-[ ] Tag extraction runs before storing any email
+[ ] Tag extraction runs for every email before storage
 [ ] Contextual prefix generated and stored in llm_context_prefix
-[ ] Prefix prepended to chunk text before embedding
-[ ] Writes to emails, email_chunks, email_embeddings in a single transaction
+[ ] "passage: " prefix prepended to chunk text before embedding
+[ ] Single transaction: emails + email_chunks + email_embeddings together
+[ ] message_id deduplication enforced
 
 Retrieval — full_rag
-[ ] Enrichment runs first — no raw query hits the vector search directly
-[ ] HyDE embedding generated and included in the multi-variant search
-[ ] Metadata pre-filter applied before vector search (not after)
-[ ] RRF applied across all variant result sets (not just top-1 variant)
+[ ] Enrichment runs first — raw query never hits vector search directly
+[ ] HyDE embedding generated and included in multi-variant set
+[ ] Metadata pre-filter runs before vector search, not after
+[ ] RRF applied across ALL variant result sets (not just top-1)
 [ ] Reranker runs on top-50 RRF results, returns top-5 to LLM
-[ ] SET LOCAL app.current_user_id set before every DB query in the request
+[ ] SET LOCAL app.current_user_id set before every DB query per request
 
-MCP Tools
-[ ] Four tools registered: email_query, search, full_rag, report_generation
-[ ] Tool descriptions match the discriminating text in this document
-[ ] stdio transport works for IDE connection
-[ ] HTTP/SSE transport available for remote access
+MCP
+[ ] Four tools registered with discriminating descriptions
+[ ] stdio transport working for IDE
+[ ] HTTP/SSE transport available for remote
 
 Report
-[ ] Fixed template enforced in system prompt — no freeform generation
-[ ] All five template sections present in every generated report
-[ ] Sources attributed with sender name and date
+[ ] Fixed template enforced in system prompt verbatim
+[ ] All six template sections present in every report
+[ ] Attribution includes sender name and date on every finding
 
 Security
-[ ] No user_id accepted from request body — only from validated auth token
-[ ] No plaintext email content in logs
-[ ] No hardcoded credentials — all from OCP Secrets via env vars
+[ ] user_id sourced from validated auth token only — never from request body
+[ ] No raw email content, subject, or chunk text in logs
+[ ] No credentials hardcoded — all from OCP Secrets via env vars
 ```
 
 ---
 
-## Experiment Ladder — Run in Order
+## Experiment Ladder — Run In Order
 
-### Experiment 1: Ingestion Quality
-Ingest 10-20 sample emails. Verify:
-- Tag extraction produces accurate `project_names`, `email_type`, `person_mentions`
-- Contextual prefix is stored in `llm_context_prefix` and looks sensible
-- Vector dimension in DB is exactly 1024
-- Single transaction — no partial rows if embedding fails
+### Experiment 1: Ingestion Quality (~1.5 hrs)
+- Ingest 10-20 sample emails (short, long status report, thread, forwarded, at
+  least 2 in French or Spanish)
+- Verify: tag extraction accurate for `project_names`, `email_type`, `person_mentions`
+- Verify: `llm_context_prefix` stored and readable
+- Verify: vector dimension in DB matches `EMBEDDING_PROFILE`
+- Verify: single transaction — kill midway and confirm no partial rows
+- Measure: time per email and Ollama call count
 
-### Experiment 2: Retrieval Ladder (Most Critical)
-Run these 5 modes against the same 5 test queries. Record top-3 results per mode:
+### Experiment 2: Retrieval Ladder — Core Evidence (~2 hrs)
+Same 5 test queries through each mode. Record top-3 results per mode.
 
-1. `email_query` — metadata filter only, no embeddings
-2. Semantic search — no contextual prefix at ingestion (baseline)
-3. Semantic search — with contextual prefix (should be better than #2)
-4. Multi-variant + RRF — no reranker
-5. Multi-variant + RRF + reranker (`full_rag`)
+```
+Mode 1: email_query          — metadata filter only, no embeddings
+Mode 2: search, no prefix    — semantic only, chunks ingested without context prefix
+Mode 3: search, with prefix  — semantic only, chunks ingested WITH context prefix
+Mode 4: multi-variant + RRF  — enrichment + 5 variants + HyDE + RRF, no reranker
+Mode 5: full_rag             — Mode 4 + reranker
+```
 
-**This ladder is the core evidence for the experiment.** Mode 5 must
-outperform Mode 2 on project-specific queries like "What's the status of Konek ID?".
+Mode 5 must outperform Mode 2 on "What's the status of Konek ID?" — this is the
+core evidence. If it does not, the pipeline has a bug.
 
-### Experiment 3: Enrichment Value
-- Run "What's the status of Konek ID?" raw → vector search → record results
-- Run same query with LLM enrichment → record results
-- Do they differ? Does enrichment surface emails the raw query missed?
-- Measure enrichment latency overhead
+### Experiment 3: Enrichment Value (~1 hr)
+- "What's the status of Konek ID?" raw → vector search → record results
+- Same query enriched → vector search → record results
+- Does enrichment surface different (better) emails? Measure latency overhead.
 
-### Experiment 4: MCP Tool Discrimination
+### Experiment 4: MCP Discrimination + RLS (~1.5 hrs)
 - Connect MCP server (stdio) to Cursor or Claude Code
-- Run 10 test queries — verify the LLM picks the correct tool each time
-- Verify SC-4: seed two users, confirm zero cross-contamination
+- Run 10 queries — verify correct tool selected each time
+- Seed two users with non-overlapping emails
+- Verify SC-4: user A queries return zero results from user B corpus
 
-### Experiment 5: Report Quality
+### Experiment 5: Report Quality + SC Verification (~1 hr)
 - Run SC-1 query → verify Kevin Sivaperumal email in top-3
 - Verify SC-2 report template structure matches exactly
-- Verify SC-5: no external API calls during the run
+- Verify SC-3 MCP and REST return same report
+- Verify SC-5 no external API calls — check logs or mock the network
 
 ---
 
 ## Tech Stack Summary
 
-| Component | Technology | Notes |
+| Component | GPU Path | CPU Path |
 |---|---|---|
-| API Framework | FastAPI (Python 3.11+, Pydantic v2) | |
-| MCP SDK | `mcp` Python SDK | stdio + HTTP/SSE transports |
-| Database | Postgres 15+ with pgvector | Bitnami image (non-root SCC compatible) |
-| Vector Dimension | 1024 | Derived from multilingual-e5-large — do not change |
-| Embedding Model | `intfloat/multilingual-e5-large` | Via sentence-transformers. Local. |
-| LLM — All Uses | `llama3.1` via Ollama | Enrichment, extraction, generation. All local. |
-| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Via sentence-transformers. Local. |
-| Encryption | OCP PVC encrypted storage class | Platform-level — confirm class name |
-| Access Control | Postgres RLS on `user_id` | `SET LOCAL app.current_user_id` per request |
-| PVC Access Mode | ReadWriteMany (RWX) | |
-| Full-Text Search | ❌ None — forbidden | |
-| External LLM API | ❌ None — forbidden | |
-| External Embedding API | ❌ None — forbidden | |
-| External Reranker API | ❌ None — forbidden | |
+| **Embedding model** | `intfloat/multilingual-e5-large` | `intfloat/multilingual-e5-base` |
+| **Vector dimensions** | 1024 | 768 |
+| **Pod scheduling** | GPU node (nodeSelector + toleration) | Any node |
+| **Pod memory (embedding)** | requests 4Gi / limits 6Gi | requests 2Gi / limits 4Gi |
+| **LLM** | `llama3.1` via Ollama | `llama3.1` via Ollama |
+| **Reranker** | `cross-encoder/ms-marco-MiniLM-L-6-v2` (local) | same |
+| **API Framework** | FastAPI (Python 3.11+, Pydantic v2) | same |
+| **MCP SDK** | `mcp` Python SDK — stdio + HTTP/SSE | same |
+| **Database** | Postgres 15+ with pgvector extension | same |
+| **Encryption** | OCP PVC encrypted storage class | same |
+| **Access Control** | Postgres RLS on `user_id` | same |
+| **PVC Access Mode** | ReadWriteMany (RWX) | same |
+| **Full-Text Search** | ❌ Forbidden | ❌ Forbidden |
+| **External LLM API** | ❌ Forbidden | ❌ Forbidden |
+| **External Embedding API** | ❌ Forbidden | ❌ Forbidden |
+| **External Reranker API** | ❌ Forbidden | ❌ Forbidden |
 
 ---
 
 *This document is the experiment specification. The code must prove the hypothesis.
-When all five success criteria pass, the experiment is done.*
+When all five success criteria pass, the experiment is complete.*
