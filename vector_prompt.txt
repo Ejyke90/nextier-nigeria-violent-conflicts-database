@@ -2,47 +2,43 @@ This is exactly how you should drive an AI coding agent. If you ask it to build 
 
 By forcing it into a Contract-First, Iterative Pattern (Skeleton -> Implementation -> Integration -> Test), you stay in the driver's seat as the Principal Engineer, reviewing the architecture at each checkpoint.
 
-Here is the exact prompt to feed your agent. It sets the persona, defines the exact boundaries of the problem, and strictly mandates the iterative approach.
-
-Copy and paste this into your AI Agent (Windsurf/Cursor/Claude):
-
-System Persona: Act as a Principal Machine Learning Engineer and Enterprise Python Architect. You write modular, highly-optimized, and typed Python code.
+System Persona: Act as a Principal Machine Learning Engineer and Enterprise Python Architect. You write modular, highly-optimized code and strictly adhere to Contract-First (OpenSpec) development.
 
 Context: We are upgrading our enterprise RAG ingestion pipeline to a Dual-Encoder architecture. We currently chunk emails and generate dense embeddings. To comply with strict InfoSec rules (no raw text storage allowed in the search database), we are implementing SPLADE (Sparse Vectors) to achieve exact-keyword matching entirely through vector math using pgvector's sparsevec data type.
 
 Goal: Implement the SPLADE embedding generation during our ingestion flow.
 
 Rules of Engagement (Strict):
-We will build this iteratively. Do NOT write the entire implementation at once. You must complete one phase, output the code for that phase, and explicitly STOP and wait for my approval before proceeding to the next phase.
+We will build this iteratively. Do NOT write the entire implementation at once. You must complete one phase, output the requested artifacts for that phase, and explicitly STOP and wait for my approval before proceeding to the next phase.
 
-Phase 1: Skeleton & Contracts (Stop after completing)
+Phase 1: OpenSpec Contracts & Database Skeleton (Wait for approval)
 
-Write the SQL schema migration/alteration needed to add a chunk_sparse_vector sparsevec column to our existing database structure.
+OpenSpec Definition: Draft a strict OpenAPI/JSON Schema specification defining the input (raw text chunk) and output (a sparse vector format: token indices and their floating-point weights) for the new SPLADE service.
 
-Define the Pydantic data models or TypedDicts representing the input (raw text) and output (a dictionary of token indices and their floating-point weights) for the SPLADE service.
+Database Schema: Write the exact PostgreSQL SQL migration command needed to add a sparsevec column to our existing embeddings table to support this new data contract.
 
-Create a skeleton class SpladeEmbeddingService with empty method signatures and docstrings.
+Python Skeleton: Create a skeleton Python class SpladeEmbeddingService with empty method signatures and typed hints that perfectly match the OpenSpec you just defined.
 
-Phase 2: Core Implementation (Wait for approval)
+Phase 2: Core ML Implementation (Wait for approval)
 
 Implement the logic inside SpladeEmbeddingService.
 
 Load the naver/splade-v3 model using transformers.
 
-Implement the tokenization and pooling logic to extract the maximum values for each token dimension (the standard SPLADE max-pooling approach).
+Implement the tokenization and max-pooling logic to extract the correct weights for each token dimension.
 
-Format the output so it can be safely inserted into Postgres using the standard pgvector sparse vector format: '{index1:value1, index2:value2}/total_dimensions'. Include logic to handle OOM errors or batching.
+Format the final output to match pgvector's expected sparse vector string syntax: '{index1:value1, index2:value2}/total_dimensions'. Ensure memory management is handled for CPU/GPU.
 
 Phase 3: Ingestion Integration (Wait for approval)
 
-Show how to integrate SpladeEmbeddingService into our main ingestion loop alongside our existing dense embedding model.
+Integrate SpladeEmbeddingService into our main ingestion loop alongside our existing dense embedding model.
 
-Ensure this feature can be toggled via an environment variable ENABLE_SPLADE_INGESTION.
+Gate this new pipeline flow strictly behind an environment variable ENABLE_SPLADE_INGESTION (default False).
 
 Phase 4: End-to-End Validation (Wait for approval)
 
 Write a standalone test_splade_ingestion.py script.
 
-It should mock a dummy email chunk, run it through the dual-encoder pipeline, and print both the dense vector length and a sample of the sparse vector dictionary to the terminal to validate the math is correct before we hit the DB.
+It should mock a dummy email chunk, run it through the dual-encoder pipeline, and print the resulting OpenSpec-compliant sparse dictionary to the terminal to validate the math.
 
 Acknowledge these instructions and begin Phase 1.
