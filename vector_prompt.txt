@@ -1,0 +1,48 @@
+This is exactly how you should drive an AI coding agent. If you ask it to build an entire SPLADE ingestion pipeline in one shot, it will hallucinate dependencies, mess up the pgvector syntax for sparse vectors, and tangle your existing logic.
+
+By forcing it into a Contract-First, Iterative Pattern (Skeleton -> Implementation -> Integration -> Test), you stay in the driver's seat as the Principal Engineer, reviewing the architecture at each checkpoint.
+
+Here is the exact prompt to feed your agent. It sets the persona, defines the exact boundaries of the problem, and strictly mandates the iterative approach.
+
+Copy and paste this into your AI Agent (Windsurf/Cursor/Claude):
+
+System Persona: Act as a Principal Machine Learning Engineer and Enterprise Python Architect. You write modular, highly-optimized, and typed Python code.
+
+Context: We are upgrading our enterprise RAG ingestion pipeline to a Dual-Encoder architecture. We currently chunk emails and generate dense embeddings. To comply with strict InfoSec rules (no raw text storage allowed in the search database), we are implementing SPLADE (Sparse Vectors) to achieve exact-keyword matching entirely through vector math using pgvector's sparsevec data type.
+
+Goal: Implement the SPLADE embedding generation during our ingestion flow.
+
+Rules of Engagement (Strict):
+We will build this iteratively. Do NOT write the entire implementation at once. You must complete one phase, output the code for that phase, and explicitly STOP and wait for my approval before proceeding to the next phase.
+
+Phase 1: Skeleton & Contracts (Stop after completing)
+
+Write the SQL schema migration/alteration needed to add a chunk_sparse_vector sparsevec column to our existing database structure.
+
+Define the Pydantic data models or TypedDicts representing the input (raw text) and output (a dictionary of token indices and their floating-point weights) for the SPLADE service.
+
+Create a skeleton class SpladeEmbeddingService with empty method signatures and docstrings.
+
+Phase 2: Core Implementation (Wait for approval)
+
+Implement the logic inside SpladeEmbeddingService.
+
+Load the naver/splade-v3 model using transformers.
+
+Implement the tokenization and pooling logic to extract the maximum values for each token dimension (the standard SPLADE max-pooling approach).
+
+Format the output so it can be safely inserted into Postgres using the standard pgvector sparse vector format: '{index1:value1, index2:value2}/total_dimensions'. Include logic to handle OOM errors or batching.
+
+Phase 3: Ingestion Integration (Wait for approval)
+
+Show how to integrate SpladeEmbeddingService into our main ingestion loop alongside our existing dense embedding model.
+
+Ensure this feature can be toggled via an environment variable ENABLE_SPLADE_INGESTION.
+
+Phase 4: End-to-End Validation (Wait for approval)
+
+Write a standalone test_splade_ingestion.py script.
+
+It should mock a dummy email chunk, run it through the dual-encoder pipeline, and print both the dense vector length and a sample of the sparse vector dictionary to the terminal to validate the math is correct before we hit the DB.
+
+Acknowledge these instructions and begin Phase 1.
