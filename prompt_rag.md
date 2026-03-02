@@ -1,5 +1,5 @@
 #  Personal Grounding Assistant
-## ADR-003 · Prompt Engineering Guide
+##  · Prompt Engineering Guide
 ### AI Agent Prompts for Codebase Review, ADR Update & Implementation
 
 ---
@@ -8,7 +8,7 @@
 
 | Document ID | Status | Owner | Date | Version |
 |---|---|---|---|---|
-| ADR-003-PROMPTS | Active | AI Platform Team | March 2026 | v1.0 |
+| -PROMPTS | Active | AI Platform Team | March 2026 | v1.0 |
 
 ---
 
