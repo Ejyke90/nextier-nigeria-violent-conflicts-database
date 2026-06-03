@@ -2,7 +2,7 @@
 
 Security review this MCP server.
 
-Service: leo0-personal-grounding-mcp
+Service: mcp
 Transport: stdio (local) + SSE (remote, if enabled)
 Auth context: RBC internal, JWT RS256 session propagated from API gateway
 
