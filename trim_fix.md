@@ -2,7 +2,7 @@
 
 ### Context
 You are working on `lim_trimming_service.py` inside the
-`leo0-personal-grounding-mcp/app/service` directory of an
+`service` directory of an
 enterprise MCP server (Personal Grounding tool) built for RBC.
 The service manages token budget for tool responses sent to
 Claude Haiku 4.5 (user-facing model). Token estimation is
