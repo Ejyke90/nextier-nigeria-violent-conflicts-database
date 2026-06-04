@@ -1,4 +1,4 @@
-# Agent Prompt: Two-Threshold Gate Fix for `llm_trimming_service.py`
+# Agent Prompt: Two-Threshold Gate Fix
 
 ---
 
