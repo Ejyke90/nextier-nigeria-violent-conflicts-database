@@ -1,7 +1,17 @@
 ```markdown
 # Candidate 3: Kristian Diana
 **McMaster University · Software & Biomedical Engineering**
-**Software Developer Intern @ RBC Amplify (current)**
+
+---
+
+# PROBLEM 3: URL Shortener
+**For: Kristian Diana**
+
+---
+
+## Your Task
+
+Implement a URL shortener. Given a long URL, return a unique short code. The system must handle collisions and support lookup in both directions.
 
 > 🎯 **Watch for:** Can the team lead become a systems thinker?
 
